@@ -1,0 +1,21 @@
+{
+    "poll_interval": {
+      "description": "轮询间隔（单位：秒）",
+      "type": "int",
+      "hint": "每次轮询 GitHub API 的间隔时间，默认值为 60 秒",
+      "default": 60
+    },
+    "github_api_base_url": {
+      "description": "GitHub API 基础 URL",
+      "type": "string",
+      "hint": "GitHub API 的基础 URL，默认值为 https://api.github.com",
+      "default": "https://api.github.com"
+    },
+    "notify_prefix": {
+      "description": "通知前缀",
+      "type": "string",
+      "hint": "通知消息前附加的前缀，用于标识消息来源",
+      "default": "[GitHubTracker]"
+    }
+  }
+  

@@ -1,14 +1,348 @@
+import asyncio
+import aiohttp
+import uuid
+import logging
+
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
+from astrbot.api.message_components import Plain
 
-@register("helloworld", "Your Name", "一个简单的 Hello World 插件", "1.0.0", "repo url")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+# 初始化 logger（插件内日志会输出到标准日志系统）
+logger = logging.getLogger("GitHubTracker")
+logger.setLevel(logging.DEBUG)  # 默认 DEBUG，后续可通过配置修改
+handler = logging.StreamHandler()
+formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+@register("github_tracker", "Your Name", "追踪 GitHub 仓库、指定操作（Issues/PR）以及用户全部操作的插件（支持自定义参数与详细日志）", "1.0.0", "https://github.com/your_repo")
+class GitHubTracker(Star):
+    def __init__(self, context: Context, config: dict):
+        """
+        初始化插件，传入 config 参数，配置项来自 _conf_schema.json
+        """
         super().__init__(context)
-    
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        '''这是一个 hello world 指令''' # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        yield event.plain_result(f"Hello, {user_name}!") # 发送一条纯文本消息
+        self.poll_interval = config.get("poll_interval", 60)
+        self.github_api_base_url = config.get("github_api_base_url", "https://api.github.com")
+        self.notify_prefix = config.get("notify_prefix", "[GitHubTracker]")
+        log_level_str = config.get("log_level", "DEBUG").upper()
+        numeric_level = getattr(logging, log_level_str, logging.DEBUG)
+        logger.setLevel(numeric_level)
+        logger.debug(f"初始化插件配置：poll_interval={self.poll_interval}, github_api_base_url={self.github_api_base_url}, notify_prefix={self.notify_prefix}, log_level={log_level_str}")
+        
+        # 存储每个会话（以 unified_msg_origin 为 key）的追踪任务
+        # 结构: { unified_msg_origin: { tracking_id: task_info, ... }, ... }
+        self.tracking_tasks = {}
+
+    async def send_notification(self, unified_msg_origin: str, text: str):
+        """发送纯文本消息，并附加通知前缀，同时记录 debug 日志"""
+        full_text = f"{self.notify_prefix} {text}"
+        logger.debug(f"send_notification to [{unified_msg_origin}]: {full_text}")
+        chain = [Plain(full_text)]
+        await self.context.send_message(unified_msg_origin, chain)
+
+    def add_tracking_task(self, unified_msg_origin: str, task_info: dict):
+        """添加新的追踪任务到会话的任务字典中，并记录日志"""
+        logger.debug(f"add_tracking_task: 会话[{unified_msg_origin}], 任务ID {task_info['id']}, 模式 {task_info['mode']}")
+        if unified_msg_origin not in self.tracking_tasks:
+            self.tracking_tasks[unified_msg_origin] = {}
+        self.tracking_tasks[unified_msg_origin][task_info["id"]] = task_info
+
+    def remove_tracking_task(self, unified_msg_origin: str, tracking_id: str):
+        """移除指定会话中对应的追踪任务，并记录日志"""
+        logger.debug(f"remove_tracking_task: 会话[{unified_msg_origin}], 移除任务ID {tracking_id}")
+        if unified_msg_origin in self.tracking_tasks:
+            if tracking_id in self.tracking_tasks[unified_msg_origin]:
+                del self.tracking_tasks[unified_msg_origin][tracking_id]
+                if not self.tracking_tasks[unified_msg_origin]:
+                    del self.tracking_tasks[unified_msg_origin]
+
+    @filter.command("track_repo")
+    async def track_repo(self, event: AstrMessageEvent, owner: str, repo: str):
+        """
+        添加一个追踪指定仓库中新 Issue 或 PR 的任务
+        用法: /track_repo owner repo
+        例如: /track_repo torvalds linux
+        """
+        unified_id = event.unified_msg_origin
+        tracking_id = str(uuid.uuid4())[:8]
+        task_info = {
+            "id": tracking_id,
+            "mode": "repo",
+            "data": {"owner": owner, "repo": repo},
+            "last_event_id": None,
+            "task": None,
+        }
+        logger.debug(f"track_repo: 添加任务 {tracking_id} -> {owner}/{repo}")
+        task = asyncio.create_task(self.repo_polling(unified_id, task_info))
+        task_info["task"] = task
+        self.add_tracking_task(unified_id, task_info)
+        yield event.plain_result(f"已添加追踪仓库 {owner}/{repo} 的任务，任务 ID: {tracking_id}")
+
+    @filter.command("track_author")
+    async def track_author(self, event: AstrMessageEvent, username: str):
+        """
+        添加一个追踪指定用户的新 Issue 或 PR 的任务（仅筛选 IssuesEvent 与 PullRequestEvent）
+        用法: /track_author username
+        例如: /track_author octocat
+        """
+        unified_id = event.unified_msg_origin
+        tracking_id = str(uuid.uuid4())[:8]
+        task_info = {
+            "id": tracking_id,
+            "mode": "author",
+            "data": {"username": username},
+            "last_event_id": None,
+            "task": None,
+        }
+        logger.debug(f"track_author: 添加任务 {tracking_id} -> 用户 {username}")
+        task = asyncio.create_task(self.author_polling(unified_id, task_info))
+        task_info["task"] = task
+        self.add_tracking_task(unified_id, task_info)
+        yield event.plain_result(f"已添加追踪用户 {username}（Issues/PR）的任务，任务 ID: {tracking_id}")
+
+    @filter.command("track_person")
+    async def track_person(self, event: AstrMessageEvent, username: str):
+        """
+        添加一个追踪指定用户所有公开操作的任务（包括 Push、Fork、Watch、Issues、PR 等）
+        用法: /track_person username
+        例如: /track_person octocat
+        """
+        unified_id = event.unified_msg_origin
+        tracking_id = str(uuid.uuid4())[:8]
+        task_info = {
+            "id": tracking_id,
+            "mode": "person",
+            "data": {"username": username},
+            "last_event_id": None,
+            "task": None,
+        }
+        logger.debug(f"track_person: 添加任务 {tracking_id} -> 用户 {username} 全部操作")
+        task = asyncio.create_task(self.person_polling(unified_id, task_info))
+        task_info["task"] = task
+        self.add_tracking_task(unified_id, task_info)
+        yield event.plain_result(f"已添加追踪用户 {username} 所有操作的任务，任务 ID: {tracking_id}")
+
+    @filter.command("list_track")
+    async def list_track(self, event: AstrMessageEvent):
+        """
+        列出当前会话下所有的追踪任务
+        用法: /list_track
+        """
+        unified_id = event.unified_msg_origin
+        tasks = self.tracking_tasks.get(unified_id, {})
+        if not tasks:
+            logger.debug(f"list_track: 会话[{unified_id}]无任务")
+            yield event.plain_result("当前没有任何追踪任务。")
+            return
+        lines = ["当前追踪任务列表:"]
+        for tid, info in tasks.items():
+            mode = info.get("mode")
+            if mode == "repo":
+                owner = info["data"]["owner"]
+                repo = info["data"]["repo"]
+                lines.append(f"- ID: {tid} | 仓库: {owner}/{repo}")
+            elif mode == "author":
+                username = info["data"]["username"]
+                lines.append(f"- ID: {tid} | 用户（Issues/PR）: {username}")
+            elif mode == "person":
+                username = info["data"]["username"]
+                lines.append(f"- ID: {tid} | 用户（所有操作）: {username}")
+        logger.debug(f"list_track: 会话[{unified_id}]任务列表：\n" + "\n".join(lines))
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("remove_track")
+    async def remove_track(self, event: AstrMessageEvent, tracking_id: str):
+        """
+        移除指定的追踪任务
+        用法: /remove_track tracking_id
+        """
+        unified_id = event.unified_msg_origin
+        tasks = self.tracking_tasks.get(unified_id, {})
+        if tracking_id not in tasks:
+            logger.debug(f"remove_track: 会话[{unified_id}]未找到任务ID {tracking_id}")
+            yield event.plain_result(f"未找到任务 ID 为 {tracking_id} 的追踪任务。")
+            return
+
+        task_info = tasks[tracking_id]
+        task = task_info.get("task")
+        if task:
+            logger.debug(f"remove_track: 正在取消任务ID {tracking_id}")
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                logger.debug(f"remove_track: 任务ID {tracking_id} 已取消")
+        self.remove_tracking_task(unified_id, tracking_id)
+        yield event.plain_result(f"已移除任务 ID {tracking_id} 的追踪任务。")
+
+    @filter.command("stop_all_track")
+    async def stop_all_track(self, event: AstrMessageEvent):
+        """
+        停止当前会话下所有追踪任务
+        用法: /stop_all_track
+        """
+        unified_id = event.unified_msg_origin
+        tasks = self.tracking_tasks.get(unified_id, {})
+        if not tasks:
+            logger.debug(f"stop_all_track: 会话[{unified_id}]无任务")
+            yield event.plain_result("当前没有任何追踪任务。")
+            return
+        for tid, info in list(tasks.items()):
+            task = info.get("task")
+            if task:
+                logger.debug(f"stop_all_track: 正在取消任务ID {tid}")
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    logger.debug(f"stop_all_track: 任务ID {tid} 已取消")
+            self.remove_tracking_task(unified_id, tid)
+        yield event.plain_result("已停止所有追踪任务。")
+
+    async def repo_polling(self, unified_msg_origin: str, task_info: dict):
+        """
+        后台轮询指定仓库的事件（仅关注 IssuesEvent 与 PullRequestEvent）
+        """
+        owner = task_info["data"]["owner"]
+        repo = task_info["data"]["repo"]
+        url = f"{self.github_api_base_url}/repos/{owner}/{repo}/events"
+        logger.debug(f"repo_polling: 开始轮询 {owner}/{repo}, URL: {url}")
+
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    async with session.get(url) as resp:
+                        logger.debug(f"repo_polling: {owner}/{repo} 状态码: {resp.status}")
+                        if resp.status != 200:
+                            await self.send_notification(unified_msg_origin, f"[{owner}/{repo}] 获取事件失败，状态码：{resp.status}")
+                        else:
+                            events = await resp.json()
+                            logger.debug(f"repo_polling: {owner}/{repo} 返回事件数: {len(events)}")
+                            new_events = []
+                            for event_item in events:
+                                event_type = event_item.get("type")
+                                if event_type not in ["IssuesEvent", "PullRequestEvent"]:
+                                    continue
+                                try:
+                                    event_id = int(event_item.get("id"))
+                                except (ValueError, TypeError):
+                                    continue
+                                if task_info["last_event_id"] is None:
+                                    task_info["last_event_id"] = event_id
+                                    logger.debug(f"repo_polling: 初始化 last_event_id 为 {event_id}")
+                                    break
+                                if event_id > task_info["last_event_id"]:
+                                    new_events.append((event_id, event_item))
+                            if new_events:
+                                new_events.sort(key=lambda x: x[0])
+                                for event_id, event_item in new_events:
+                                    action = event_item.get("payload", {}).get("action", "unknown")
+                                    title = (event_item.get("payload", {}).get("issue", {}).get("title") or
+                                             event_item.get("payload", {}).get("pull_request", {}).get("title", ""))
+                                    msg = f"[{owner}/{repo}] 新 {event_item.get('type')}：{action} {title}"
+                                    logger.debug(f"repo_polling: 检测到新事件: {msg}")
+                                    await self.send_notification(unified_msg_origin, msg)
+                                task_info["last_event_id"] = max(eid for eid, _ in new_events)
+                                logger.debug(f"repo_polling: 更新 last_event_id 为 {task_info['last_event_id']}")
+                except Exception as e:
+                    logger.exception(f"repo_polling: {owner}/{repo} 轮询异常")
+                    await self.send_notification(unified_msg_origin, f"[{owner}/{repo}] 轮询时出错：{str(e)}")
+                await asyncio.sleep(self.poll_interval)
+
+    async def author_polling(self, unified_msg_origin: str, task_info: dict):
+        """
+        后台轮询指定用户的公开事件，仅筛选 IssuesEvent 与 PullRequestEvent
+        """
+        username = task_info["data"]["username"]
+        url = f"{self.github_api_base_url}/users/{username}/events/public"
+        logger.debug(f"author_polling: 开始轮询用户 {username}, URL: {url}")
+
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    async with session.get(url) as resp:
+                        logger.debug(f"author_polling: 用户 {username} 状态码: {resp.status}")
+                        if resp.status != 200:
+                            await self.send_notification(unified_msg_origin, f"[{username}] 获取公开事件失败，状态码：{resp.status}")
+                        else:
+                            events = await resp.json()
+                            logger.debug(f"author_polling: 用户 {username} 返回事件数: {len(events)}")
+                            new_events = []
+                            for event_item in events:
+                                event_type = event_item.get("type")
+                                if event_type not in ["IssuesEvent", "PullRequestEvent"]:
+                                    continue
+                                try:
+                                    event_id = int(event_item.get("id"))
+                                except (ValueError, TypeError):
+                                    continue
+                                if task_info["last_event_id"] is None:
+                                    task_info["last_event_id"] = event_id
+                                    logger.debug(f"author_polling: 初始化 last_event_id 为 {event_id}")
+                                    break
+                                if event_id > task_info["last_event_id"]:
+                                    new_events.append((event_id, event_item))
+                            if new_events:
+                                new_events.sort(key=lambda x: x[0])
+                                for event_id, event_item in new_events:
+                                    action = event_item.get("payload", {}).get("action", "unknown")
+                                    title = (event_item.get("payload", {}).get("issue", {}).get("title") or
+                                             event_item.get("payload", {}).get("pull_request", {}).get("title", ""))
+                                    msg = f"[{username}] 新 {event_item.get('type')}：{action} {title}"
+                                    logger.debug(f"author_polling: 检测到新事件: {msg}")
+                                    await self.send_notification(unified_msg_origin, msg)
+                                task_info["last_event_id"] = max(eid for eid, _ in new_events)
+                                logger.debug(f"author_polling: 更新 last_event_id 为 {task_info['last_event_id']}")
+                except Exception as e:
+                    logger.exception(f"author_polling: 用户 {username} 轮询异常")
+                    await self.send_notification(unified_msg_origin, f"[{username}] 轮询时出错：{str(e)}")
+                await asyncio.sleep(self.poll_interval)
+
+    async def person_polling(self, unified_msg_origin: str, task_info: dict):
+        """
+        后台轮询指定用户的所有公开事件，不做类型过滤，尽可能显示事件的关键信息
+        """
+        username = task_info["data"]["username"]
+        url = f"{self.github_api_base_url}/users/{username}/events/public"
+        logger.debug(f"person_polling: 开始轮询用户 {username} 所有操作, URL: {url}")
+
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    async with session.get(url) as resp:
+                        logger.debug(f"person_polling: 用户 {username} 状态码: {resp.status}")
+                        if resp.status != 200:
+                            await self.send_notification(unified_msg_origin, f"[{username}] 获取公开事件失败，状态码：{resp.status}")
+                        else:
+                            events = await resp.json()
+                            logger.debug(f"person_polling: 用户 {username} 返回事件数: {len(events)}")
+                            new_events = []
+                            for event_item in events:
+                                try:
+                                    event_id = int(event_item.get("id"))
+                                except (ValueError, TypeError):
+                                    continue
+                                if task_info["last_event_id"] is None:
+                                    task_info["last_event_id"] = event_id
+                                    logger.debug(f"person_polling: 初始化 last_event_id 为 {event_id}")
+                                    break
+                                if event_id > task_info["last_event_id"]:
+                                    new_events.append((event_id, event_item))
+                            if new_events:
+                                new_events.sort(key=lambda x: x[0])
+                                for event_id, event_item in new_events:
+                                    evt_type = event_item.get("type", "UnknownEvent")
+                                    repo_name = event_item.get("repo", {}).get("name", "")
+                                    payload = event_item.get("payload", {})
+                                    action = payload.get("action", "")
+                                    detail = action if action else str(payload)[:100]
+                                    msg = f"[{username}] {evt_type} 在 {repo_name}：{detail}"
+                                    logger.debug(f"person_polling: 检测到新事件: {msg}")
+                                    await self.send_notification(unified_msg_origin, msg)
+                                task_info["last_event_id"] = max(eid for eid, _ in new_events)
+                                logger.debug(f"person_polling: 更新 last_event_id 为 {task_info['last_event_id']}")
+                except Exception as e:
+                    logger.exception(f"person_polling: 用户 {username} 轮询异常")
+                    await self.send_notification(unified_msg_origin, f"[{username}] 轮询时出错：{str(e)}")
+                await asyncio.sleep(self.poll_interval)
