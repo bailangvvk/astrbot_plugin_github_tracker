@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import uuid
 import logging
+import json
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
@@ -15,7 +16,7 @@ formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-@register("github_tracker", "Your Name", "追踪 GitHub 仓库、指定操作（Issues/PR）以及用户全部操作的插件（支持自定义参数与详细日志）", "1.0.0", "https://github.com/your_repo")
+@register("github_tracker", "Your Name", "追踪 GitHub 仓库、指定操作（Issues/PR）、用户全部操作及生成 OpenGraph 预览图片的插件（支持自定义参数与详细日志）", "1.0.0", "https://github.com/your_repo")
 class GitHubTracker(Star):
     def __init__(self, context: Context, config: dict):
         """
@@ -346,3 +347,117 @@ class GitHubTracker(Star):
                     logger.exception(f"person_polling: 用户 {username} 轮询异常")
                     await self.send_notification(unified_msg_origin, f"[{username}] 轮询时出错：{str(e)}")
                 await asyncio.sleep(self.poll_interval)
+
+    # ----------------------- OpenGraph 预览功能 -----------------------
+
+    @filter.command("og_repo")
+    async def og_repo(self, event: AstrMessageEvent, owner: str, repo: str):
+        """
+        生成指定仓库的 OpenGraph 风格预览图
+        用法: /og_repo owner repo
+        例如: /og_repo torvalds linux
+        """
+        unified_id = event.unified_msg_origin
+        url = f"{self.github_api_base_url}/repos/{owner}/{repo}"
+        logger.debug(f"og_repo: 获取仓库信息 {owner}/{repo}, URL: {url}")
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        msg = f"获取仓库信息失败，状态码：{resp.status}"
+                        logger.error(f"og_repo: {msg}")
+                        yield event.plain_result(msg)
+                        return
+                    repo_info = await resp.json()
+            except Exception as e:
+                logger.exception("og_repo: 异常")
+                yield event.plain_result(f"获取仓库信息时出错：{str(e)}")
+                return
+
+        # 构造 HTML 模板，展示仓库名称、描述、星标、fork 数等信息
+        tmpl = """
+        <div style="width:600px; padding:20px; font-family:Arial, sans-serif; background-color:#f5f5f5;">
+          <h1 style="margin:0; color:#333;">{{ name }}</h1>
+          <p style="color:#666;">{{ description }}</p>
+          <ul style="list-style:none; padding:0;">
+            <li><strong>Stars:</strong> {{ stargazers_count }}</li>
+            <li><strong>Forks:</strong> {{ forks_count }}</li>
+            <li><strong>Open Issues:</strong> {{ open_issues_count }}</li>
+          </ul>
+          <a href="{{ html_url }}" style="text-decoration:none; color:#0366d6;">查看详情</a>
+        </div>
+        """
+        context_data = {
+            "name": repo_info.get("full_name", ""),
+            "description": repo_info.get("description", "暂无描述"),
+            "stargazers_count": repo_info.get("stargazers_count", 0),
+            "forks_count": repo_info.get("forks_count", 0),
+            "open_issues_count": repo_info.get("open_issues_count", 0),
+            "html_url": repo_info.get("html_url", "#")
+        }
+        logger.debug(f"og_repo: 渲染模板数据：{json.dumps(context_data)}")
+        try:
+            url_img = await self.html_render(tmpl, context_data)
+            yield event.image_result(url_img)
+        except Exception as e:
+            logger.exception("og_repo: 渲染图片异常")
+            yield event.plain_result(f"生成预览图时出错：{str(e)}")
+
+    @filter.command("og_issue")
+    async def og_issue(self, event: AstrMessageEvent, owner: str, repo: str, issue_number: int):
+        """
+        生成指定 Issue 的 OpenGraph 风格预览图
+        用法: /og_issue owner repo issue_number
+        例如: /og_issue torvalds linux 123
+        """
+        unified_id = event.unified_msg_origin
+        url = f"{self.github_api_base_url}/repos/{owner}/{repo}/issues/{issue_number}"
+        logger.debug(f"og_issue: 获取 Issue 信息 {owner}/{repo} Issue#{issue_number}, URL: {url}")
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        msg = f"获取 Issue 信息失败，状态码：{resp.status}"
+                        logger.error(f"og_issue: {msg}")
+                        yield event.plain_result(msg)
+                        return
+                    issue_info = await resp.json()
+            except Exception as e:
+                logger.exception("og_issue: 异常")
+                yield event.plain_result(f"获取 Issue 信息时出错：{str(e)}")
+                return
+
+        # 修改后的 HTML 模板，使用固定尺寸及 Flex 布局使内容居中
+        tmpl = """
+        <div style="width:600px; height:400px; background-color:#fffbe6; display:flex; flex-direction:column; justify-content:center; align-items:center; font-family:Arial, sans-serif; padding:20px; box-sizing:border-box;">
+          <div style="width:100%; text-align:center;">
+            <h1 style="margin:0; color:#d73a49; font-size:28px;">#{{ number }}: {{ title }}</h1>
+            <p style="color:#586069; font-size:16px; margin:10px 0;">{{ body }}</p>
+            <ul style="list-style:none; padding:0; margin:10px 0; font-size:16px;">
+              <li><strong>状态:</strong> {{ state }}</li>
+              <li><strong>评论数:</strong> {{ comments }}</li>
+            </ul>
+            <div>
+              <a href="{{ html_url }}" style="text-decoration:none; color:#0366d6; font-size:16px;">在 GitHub 上查看</a>
+            </div>
+          </div>
+        </div>
+        """
+        context_data = {
+            "number": issue_info.get("number", ""),
+            "title": issue_info.get("title", ""),
+            "body": issue_info.get("body", "")[:200] + "..." if issue_info.get("body") and len(issue_info.get("body")) > 200 else issue_info.get("body", ""),
+            "state": issue_info.get("state", ""),
+            "comments": issue_info.get("comments", 0),
+            "html_url": issue_info.get("html_url", "#")
+        }
+        logger.debug(f"og_issue: 渲染模板数据：{json.dumps(context_data)}")
+        try:
+            url_img = await self.html_render(tmpl, context_data)
+            yield event.image_result(url_img)
+        except Exception as e:
+            logger.exception("og_issue: 渲染图片异常")
+            yield event.plain_result(f"生成预览图时出错：{str(e)}")
+

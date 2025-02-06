@@ -1,6 +1,36 @@
-name: astrbot_plugin_github_tracker # 这是你的插件的唯一识别名。
-desc: 这是 AstrBot 的默认插件，支持关键词回复。 # 插件简短描述
-help: 输入 /keyword 查看关键词回复帮助。 # 插件的帮助信息
-version: v1.3 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: w33d # 作者
-repo: https://github.com/Last-emo-boy/astrbot_plugin_github_tracker # 插件的仓库地址
+name: astrbot_plugin_github_tracker
+desc: 视奸别人github活动。
+help: |
+  命令列表:
+  - /track_repo owner repo  
+    用法：/track_repo torvalds linux  
+    描述：追踪指定仓库中新 Issue/PR 的事件。
+
+  - /track_author username  
+    用法：/track_author octocat  
+    描述：追踪指定用户（仅 Issues/PR）的公开事件。
+
+  - /track_person username  
+    用法：/track_person octocat  
+    描述：追踪指定用户所有公开操作（包括 Push、Fork、Watch、Issues、PR 等）。
+
+  - /list_track  
+    描述：列出当前会话下所有追踪任务及其任务 ID。
+
+  - /remove_track tracking_id  
+    用法：/remove_track ab12cd34  
+    描述：移除指定的追踪任务。
+
+  - /stop_all_track  
+    描述：停止当前会话下所有追踪任务。
+
+  - /og_repo owner repo  
+    用法：/og_repo torvalds linux  
+    描述：生成指定仓库的 OpenGraph 预览图，展示仓库信息。
+
+  - /og_issue owner repo issue_number  
+    用法：/og_issue torvalds linux 123  
+    描述：生成指定 Issue 的 OpenGraph 预览图，展示 Issue 详情。
+version: v1.0
+author: w33d
+repo: https://github.com/Last-emo-boy/astrbot_plugin_github_tracker

@@ -16,6 +16,12 @@
       "type": "string",
       "hint": "通知消息前附加的前缀，用于标识消息来源",
       "default": "[GitHubTracker]"
+    },
+    "log_level": {
+      "description": "日志输出等级",
+      "type": "string",
+      "hint": "日志等级，可选值 DEBUG/INFO/WARNING/ERROR，默认 DEBUG",
+      "default": "INFO"
     }
   }
   
