@@ -7,6 +7,7 @@ import json
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Plain
+from astrbot.api.event import MessageChain
 
 # 初始化 logger（插件内日志会输出到标准日志系统）
 logger = logging.getLogger("GitHubTracker")
@@ -39,7 +40,8 @@ class GitHubTracker(Star):
         """发送纯文本消息，并附加通知前缀，同时记录 debug 日志"""
         full_text = f"{self.notify_prefix} {text}"
         logger.debug(f"send_notification to [{unified_msg_origin}]: {full_text}")
-        chain = [Plain(full_text)]
+        # 构造 MessageChain 对象
+        chain = MessageChain().message(full_text)
         await self.context.send_message(unified_msg_origin, chain)
 
     def add_tracking_task(self, unified_msg_origin: str, task_info: dict):
