@@ -3,11 +3,11 @@ import aiohttp
 import uuid
 import logging
 import json
+import os
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Plain
-from astrbot.api.event import MessageChain
 
 # 初始化 logger（插件内日志会输出到标准日志系统）
 logger = logging.getLogger("GitHubTracker")
@@ -17,7 +17,7 @@ formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-@register("github_tracker", "Your Name", "追踪 GitHub 仓库、指定操作（Issues/PR）、用户全部操作及生成 OpenGraph 预览图片的插件（支持自定义参数与详细日志）", "1.0.0", "https://github.com/your_repo")
+@register("github_tracker", "w33d", "追踪 GitHub 仓库、指定操作（Issues/PR）、用户全部操作及生成 OpenGraph 预览图片的插件（支持自定义参数与详细日志，支持任务持久化）", "1.0.1", "https://github.com/Last-emo-boy/astrbot_plugin_github_tracker")
 class GitHubTracker(Star):
     def __init__(self, context: Context, config: dict):
         """
@@ -31,16 +31,78 @@ class GitHubTracker(Star):
         numeric_level = getattr(logging, log_level_str, logging.DEBUG)
         logger.setLevel(numeric_level)
         logger.debug(f"初始化插件配置：poll_interval={self.poll_interval}, github_api_base_url={self.github_api_base_url}, notify_prefix={self.notify_prefix}, log_level={log_level_str}")
-        
+
+        # 持久化任务文件路径（与当前文件同目录）
+        self.persist_file = os.path.join(os.path.dirname(__file__), "tracking_tasks.json")
         # 存储每个会话（以 unified_msg_origin 为 key）的追踪任务
         # 结构: { unified_msg_origin: { tracking_id: task_info, ... }, ... }
         self.tracking_tasks = {}
+
+        # 加载持久化任务，并启动对应的后台轮询任务
+        self.load_persistent_tasks()
+
+    def save_tracking_tasks(self):
+        """将当前追踪任务保存到文件，只保存必要的字段"""
+        data = {}
+        for unified_id, tasks in self.tracking_tasks.items():
+            data[unified_id] = {}
+            for tid, task_info in tasks.items():
+                data[unified_id][tid] = {
+                    "id": task_info["id"],
+                    "mode": task_info["mode"],
+                    "data": task_info["data"],
+                    "last_event_id": task_info["last_event_id"]
+                }
+        try:
+            with open(self.persist_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.debug(f"保存持久化任务成功，共保存 {len(data)} 个会话的数据")
+        except Exception as e:
+            logger.exception(f"保存持久化任务失败: {str(e)}")
+
+    def load_tracking_tasks_from_file(self):
+        """从文件加载任务数据"""
+        if not os.path.exists(self.persist_file):
+            return {}
+        try:
+            with open(self.persist_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            logger.debug("加载持久化任务成功")
+            return data
+        except Exception as e:
+            logger.exception(f"加载持久化任务失败: {str(e)}")
+            return {}
+
+    def load_persistent_tasks(self):
+        """加载持久化任务，并为每个任务启动后台轮询任务"""
+        persisted = self.load_tracking_tasks_from_file()
+        for unified_id, tasks in persisted.items():
+            if unified_id not in self.tracking_tasks:
+                self.tracking_tasks[unified_id] = {}
+            for tid, task_data in tasks.items():
+                task_info = {
+                    "id": task_data["id"],
+                    "mode": task_data["mode"],
+                    "data": task_data["data"],
+                    "last_event_id": task_data.get("last_event_id"),
+                    "task": None
+                }
+                if task_info["mode"] == "repo":
+                    task = asyncio.create_task(self.repo_polling(unified_id, task_info))
+                elif task_info["mode"] == "author":
+                    task = asyncio.create_task(self.author_polling(unified_id, task_info))
+                elif task_info["mode"] == "person":
+                    task = asyncio.create_task(self.person_polling(unified_id, task_info))
+                else:
+                    continue
+                task_info["task"] = task
+                self.tracking_tasks[unified_id][tid] = task_info
+                logger.debug(f"load_persistent_tasks: 加载任务 {tid} 模式: {task_info['mode']} for 会话 {unified_id}")
 
     async def send_notification(self, unified_msg_origin: str, text: str):
         """发送纯文本消息，并附加通知前缀，同时记录 debug 日志"""
         full_text = f"{self.notify_prefix} {text}"
         logger.debug(f"send_notification to [{unified_msg_origin}]: {full_text}")
-        # 构造 MessageChain 对象
         chain = MessageChain().message(full_text)
         await self.context.send_message(unified_msg_origin, chain)
 
@@ -50,6 +112,7 @@ class GitHubTracker(Star):
         if unified_msg_origin not in self.tracking_tasks:
             self.tracking_tasks[unified_msg_origin] = {}
         self.tracking_tasks[unified_msg_origin][task_info["id"]] = task_info
+        self.save_tracking_tasks()
 
     def remove_tracking_task(self, unified_msg_origin: str, tracking_id: str):
         """移除指定会话中对应的追踪任务，并记录日志"""
@@ -59,6 +122,7 @@ class GitHubTracker(Star):
                 del self.tracking_tasks[unified_msg_origin][tracking_id]
                 if not self.tracking_tasks[unified_msg_origin]:
                     del self.tracking_tasks[unified_msg_origin]
+        self.save_tracking_tasks()
 
     @filter.command("track_repo")
     async def track_repo(self, event: AstrMessageEvent, owner: str, repo: str):
@@ -248,6 +312,7 @@ class GitHubTracker(Star):
                                     await self.send_notification(unified_msg_origin, msg)
                                 task_info["last_event_id"] = max(eid for eid, _ in new_events)
                                 logger.debug(f"repo_polling: 更新 last_event_id 为 {task_info['last_event_id']}")
+                                self.save_tracking_tasks()
                 except Exception as e:
                     logger.exception(f"repo_polling: {owner}/{repo} 轮询异常")
                     await self.send_notification(unified_msg_origin, f"[{owner}/{repo}] 轮询时出错：{str(e)}")
@@ -297,6 +362,7 @@ class GitHubTracker(Star):
                                     await self.send_notification(unified_msg_origin, msg)
                                 task_info["last_event_id"] = max(eid for eid, _ in new_events)
                                 logger.debug(f"author_polling: 更新 last_event_id 为 {task_info['last_event_id']}")
+                                self.save_tracking_tasks()
                 except Exception as e:
                     logger.exception(f"author_polling: 用户 {username} 轮询异常")
                     await self.send_notification(unified_msg_origin, f"[{username}] 轮询时出错：{str(e)}")
@@ -345,6 +411,7 @@ class GitHubTracker(Star):
                                     await self.send_notification(unified_msg_origin, msg)
                                 task_info["last_event_id"] = max(eid for eid, _ in new_events)
                                 logger.debug(f"person_polling: 更新 last_event_id 为 {task_info['last_event_id']}")
+                                self.save_tracking_tasks()
                 except Exception as e:
                     logger.exception(f"person_polling: 用户 {username} 轮询异常")
                     await self.send_notification(unified_msg_origin, f"[{username}] 轮询时出错：{str(e)}")
@@ -377,7 +444,6 @@ class GitHubTracker(Star):
                 yield event.plain_result(f"获取仓库信息时出错：{str(e)}")
                 return
 
-        # 构造 HTML 模板，展示仓库名称、描述、星标、fork 数等信息
         tmpl = """
         <div style="width:600px; padding:20px; font-family:Arial, sans-serif; background-color:#f5f5f5;">
           <h1 style="margin:0; color:#333;">{{ name }}</h1>
@@ -431,7 +497,6 @@ class GitHubTracker(Star):
                 yield event.plain_result(f"获取 Issue 信息时出错：{str(e)}")
                 return
 
-        # 修改后的 HTML 模板，使用固定尺寸及 Flex 布局使内容居中
         tmpl = """
         <div style="width:600px; height:400px; background-color:#fffbe6; display:flex; flex-direction:column; justify-content:center; align-items:center; font-family:Arial, sans-serif; padding:20px; box-sizing:border-box;">
           <div style="width:100%; text-align:center;">
@@ -450,7 +515,9 @@ class GitHubTracker(Star):
         context_data = {
             "number": issue_info.get("number", ""),
             "title": issue_info.get("title", ""),
-            "body": issue_info.get("body", "")[:200] + "..." if issue_info.get("body") and len(issue_info.get("body")) > 200 else issue_info.get("body", ""),
+            "body": (issue_info.get("body", "")[:200] + "..." 
+                     if issue_info.get("body") and len(issue_info.get("body")) > 200 
+                     else issue_info.get("body", "")),
             "state": issue_info.get("state", ""),
             "comments": issue_info.get("comments", 0),
             "html_url": issue_info.get("html_url", "#")
@@ -462,4 +529,3 @@ class GitHubTracker(Star):
         except Exception as e:
             logger.exception("og_issue: 渲染图片异常")
             yield event.plain_result(f"生成预览图时出错：{str(e)}")
-
