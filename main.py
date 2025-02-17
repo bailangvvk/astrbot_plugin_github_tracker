@@ -18,7 +18,7 @@ formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-@register("github_tracker", "w33d", "追踪 GitHub 仓库、指定操作（Issues/PR）、用户全部操作及生成 OpenGraph 预览图片的插件（支持自定义参数与详细日志，支持任务持久化）", "1.0.1", "https://github.com/Last-emo-boy/astrbot_plugin_github_tracker")
+@register("github_tracker", "w33d", "追踪 GitHub 仓库、指定操作（Issues/PR）、用户全部操作及生成 OpenGraph 预览图片的插件（支持自定义参数与详细日志，支持任务持久化）", "1.2", "https://github.com/Last-emo-boy/astrbot_plugin_github_tracker")
 class GitHubTracker(Star):
     def __init__(self, context: Context, config: dict):
         """

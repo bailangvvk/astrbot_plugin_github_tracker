@@ -31,6 +31,6 @@ help: |
   - /og_issue owner repo issue_number  
     用法：/og_issue torvalds linux 123  
     描述：生成指定 Issue 的 OpenGraph 预览图，展示 Issue 详情。
-version: v1.1
+version: v1.2
 author: w33d
 repo: https://github.com/Last-emo-boy/astrbot_plugin_github_tracker
