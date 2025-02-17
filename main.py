@@ -8,6 +8,7 @@ import os
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Plain
+from astrbot.api.all import llm_tool
 
 # 初始化 logger（插件内日志会输出到标准日志系统）
 logger = logging.getLogger("GitHubTracker")
@@ -529,3 +530,84 @@ class GitHubTracker(Star):
         except Exception as e:
             logger.exception("og_issue: 渲染图片异常")
             yield event.plain_result(f"生成预览图时出错：{str(e)}")
+    
+    
+    # =============================
+    # LLM Function-Calling
+    # =============================
+
+    @llm_tool(name="get_repo_summary")
+    async def get_repo_summary(self, event: AstrMessageEvent, owner: str, repo: str) -> MessageEventResult:
+        '''获取指定 GitHub 仓库的基本信息摘要。
+
+        Args:
+            owner(string): 仓库所有者
+            repo(string): 仓库名称
+        '''
+        url = f"{self.github_api_base_url}/repos/{owner}/{repo}"
+        logger.debug(f"llm_tool get_repo_summary: 获取仓库信息 {owner}/{repo}, URL: {url}")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    yield event.plain_result(f"获取仓库信息失败，状态码：{resp.status}")
+                    return
+                repo_info = await resp.json()
+        summary = (
+            f"仓库: {repo_info.get('full_name', '未知')}\n"
+            f"描述: {repo_info.get('description', '无描述')}\n"
+            f"Stars: {repo_info.get('stargazers_count', 0)}\n"
+            f"Forks: {repo_info.get('forks_count', 0)}"
+        )
+        yield event.plain_result(summary)
+
+    @llm_tool(name="llm_track_repo")
+    async def llm_track_repo(self, event: AstrMessageEvent, owner: str, repo: str) -> MessageEventResult:
+        '''通过 LLM 调用，添加追踪指定仓库事件的任务。
+
+        Args:
+            owner(string): 仓库所有者
+            repo(string): 仓库名称
+        '''
+        logger.debug(f"llm_tool llm_track_repo: 请求添加追踪仓库任务 {owner}/{repo}")
+        results = []
+        async for res in self.track_repo(event, owner, repo):
+            results.append(res)
+        # 返回最后一条消息作为确认
+        yield results[-1] if results else event.plain_result("添加追踪任务失败")
+
+    @llm_tool(name="llm_track_person")
+    async def llm_track_person(self, event: AstrMessageEvent, username: str) -> MessageEventResult:
+        '''通过 LLM 调用，添加追踪指定用户所有公开操作的任务。
+
+        Args:
+            username(string): 用户名
+        '''
+        logger.debug(f"llm_tool llm_track_person: 请求添加追踪用户全部操作任务 {username}")
+        results = []
+        async for res in self.track_person(event, username):
+            results.append(res)
+        yield results[-1] if results else event.plain_result("添加追踪任务失败")
+
+    @llm_tool(name="get_person_activity_summary")
+    async def get_person_activity_summary(self, event: AstrMessageEvent, username: str) -> MessageEventResult:
+        '''通过 LLM 调用，获取指定用户最近公开活动的摘要信息。
+
+        Args:
+            username(string): 用户名
+        '''
+        url = f"{self.github_api_base_url}/users/{username}/events/public"
+        logger.debug(f"llm_tool get_person_activity_summary: 获取用户 {username} 活动摘要, URL: {url}")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    yield event.plain_result(f"获取用户活动失败，状态码：{resp.status}")
+                    return
+                events = await resp.json()
+        # 汇总各事件类型数量
+        summary_dict = {}
+        for ev in events:
+            t = ev.get("type", "Unknown")
+            summary_dict[t] = summary_dict.get(t, 0) + 1
+        summary_lines = [f"{k}: {v}" for k, v in summary_dict.items()]
+        summary = f"用户 {username} 最近活动摘要：\n" + "\n".join(summary_lines)
+        yield event.plain_result(summary)
