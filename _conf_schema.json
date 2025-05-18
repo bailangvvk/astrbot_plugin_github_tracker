@@ -11,6 +11,12 @@
       "hint": "GitHub API 的基础 URL，默认值为 https://api.github.com",
       "default": "https://api.github.com"
     },
+    "github_token": {
+      "description": "GitHub API 访问令牌",
+      "type": "string",
+      "hint": "GitHub 个人访问令牌，用于提高 API 请求限制至每小时5000次，以及访问私有仓库",
+      "default": ""
+    },
     "notify_prefix": {
       "description": "通知前缀",
       "type": "string",
@@ -22,6 +28,11 @@
       "type": "string",
       "hint": "日志等级，可选值 DEBUG/INFO/WARNING/ERROR，默认 DEBUG",
       "default": "INFO"
+    },
+    "hide_errors": {
+      "description": "隐藏错误消息",
+      "type": "bool",
+      "hint": "是否在轮询过程中隐藏API错误消息（不发送至聊天，仅记录日志）",
+      "default": true
     }
   }
-  

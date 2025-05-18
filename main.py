@@ -4,6 +4,7 @@ import uuid
 import logging
 import json
 import os
+import time
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
 from astrbot.api.star import Context, Star, register
@@ -27,11 +28,21 @@ class GitHubTracker(Star):
         super().__init__(context)
         self.poll_interval = config.get("poll_interval", 60)
         self.github_api_base_url = config.get("github_api_base_url", "https://api.github.com")
+        self.github_token = config.get("github_token", "")
         self.notify_prefix = config.get("notify_prefix", "[GitHubTracker]")
+        self.hide_errors = config.get("hide_errors", True)
         log_level_str = config.get("log_level", "DEBUG").upper()
         numeric_level = getattr(logging, log_level_str, logging.DEBUG)
         logger.setLevel(numeric_level)
         logger.debug(f"初始化插件配置：poll_interval={self.poll_interval}, github_api_base_url={self.github_api_base_url}, notify_prefix={self.notify_prefix}, log_level={log_level_str}")
+        logger.debug(f"GitHub Token配置状态：{'已配置' if self.github_token else '未配置'}")
+        
+        # 存储API请求速率限制信息
+        self.rate_limit = {
+            "limit": 60 if not self.github_token else 5000,
+            "remaining": 60 if not self.github_token else 5000,
+            "reset": 0
+        }
 
         # 持久化任务文件路径（与当前文件同目录）
         self.persist_file = os.path.join(os.path.dirname(__file__), "tracking_tasks.json")
@@ -100,8 +111,20 @@ class GitHubTracker(Star):
                 self.tracking_tasks[unified_id][tid] = task_info
                 logger.debug(f"load_persistent_tasks: 加载任务 {tid} 模式: {task_info['mode']} for 会话 {unified_id}")
 
-    async def send_notification(self, unified_msg_origin: str, text: str):
-        """发送纯文本消息，并附加通知前缀，同时记录 debug 日志"""
+    async def send_notification(self, unified_msg_origin: str, text: str, is_error: bool = False):
+        """
+        发送纯文本消息，并附加通知前缀，同时记录 debug 日志
+        
+        Args:
+            unified_msg_origin: 消息目标
+            text: 消息内容
+            is_error: 是否是错误消息，如果是且配置了hide_errors=True，则只记录日志不发送消息
+        """
+        # 如果是错误消息且配置为隐藏错误，则只记录日志
+        if is_error and self.hide_errors:
+            logger.debug(f"隐藏错误消息 [{unified_msg_origin}]: {text}")
+            return
+            
         full_text = f"{self.notify_prefix} {text}"
         logger.debug(f"send_notification to [{unified_msg_origin}]: {full_text}")
         chain = MessageChain().message(full_text)
@@ -280,43 +303,46 @@ class GitHubTracker(Star):
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    async with session.get(url) as resp:
-                        logger.debug(f"repo_polling: {owner}/{repo} 状态码: {resp.status}")
-                        if resp.status != 200:
-                            await self.send_notification(unified_msg_origin, f"[{owner}/{repo}] 获取事件失败，状态码：{resp.status}")
-                        else:
-                            events = await resp.json()
-                            logger.debug(f"repo_polling: {owner}/{repo} 返回事件数: {len(events)}")
-                            new_events = []
-                            for event_item in events:
-                                event_type = event_item.get("type")
-                                if event_type not in ["IssuesEvent", "PullRequestEvent"]:
-                                    continue
-                                try:
-                                    event_id = int(event_item.get("id"))
-                                except (ValueError, TypeError):
-                                    continue
-                                if task_info["last_event_id"] is None:
-                                    task_info["last_event_id"] = event_id
-                                    logger.debug(f"repo_polling: 初始化 last_event_id 为 {event_id}")
-                                    break
-                                if event_id > task_info["last_event_id"]:
-                                    new_events.append((event_id, event_item))
-                            if new_events:
-                                new_events.sort(key=lambda x: x[0])
-                                for event_id, event_item in new_events:
-                                    action = event_item.get("payload", {}).get("action", "unknown")
-                                    title = (event_item.get("payload", {}).get("issue", {}).get("title") or
-                                             event_item.get("payload", {}).get("pull_request", {}).get("title", ""))
-                                    msg = f"[{owner}/{repo}] 新 {event_item.get('type')}：{action} {title}"
-                                    logger.debug(f"repo_polling: 检测到新事件: {msg}")
-                                    await self.send_notification(unified_msg_origin, msg)
-                                task_info["last_event_id"] = max(eid for eid, _ in new_events)
-                                logger.debug(f"repo_polling: 更新 last_event_id 为 {task_info['last_event_id']}")
-                                self.save_tracking_tasks()
+                    success, result = await self.request_github_api(session, url)
+                    
+                    if not success:
+                        # 请求失败，发送错误通知（如果配置允许）
+                        logger.error(f"repo_polling: {owner}/{repo} 请求失败: {result}")
+                        await self.send_notification(unified_msg_origin, f"[{owner}/{repo}] 获取事件失败: {result}", is_error=True)
+                    else:
+                        # 请求成功，处理事件
+                        events = result
+                        logger.debug(f"repo_polling: {owner}/{repo} 返回事件数: {len(events)}")
+                        new_events = []
+                        for event_item in events:
+                            event_type = event_item.get("type")
+                            if event_type not in ["IssuesEvent", "PullRequestEvent"]:
+                                continue
+                            try:
+                                event_id = int(event_item.get("id"))
+                            except (ValueError, TypeError):
+                                continue
+                            if task_info["last_event_id"] is None:
+                                task_info["last_event_id"] = event_id
+                                logger.debug(f"repo_polling: 初始化 last_event_id 为 {event_id}")
+                                break
+                            if event_id > task_info["last_event_id"]:
+                                new_events.append((event_id, event_item))
+                        if new_events:
+                            new_events.sort(key=lambda x: x[0])
+                            for event_id, event_item in new_events:
+                                action = event_item.get("payload", {}).get("action", "unknown")
+                                title = (event_item.get("payload", {}).get("issue", {}).get("title") or
+                                        event_item.get("payload", {}).get("pull_request", {}).get("title", ""))
+                                msg = f"[{owner}/{repo}] 新 {event_item.get('type')}：{action} {title}"
+                                logger.debug(f"repo_polling: 检测到新事件: {msg}")
+                                await self.send_notification(unified_msg_origin, msg)
+                            task_info["last_event_id"] = max(eid for eid, _ in new_events)
+                            logger.debug(f"repo_polling: 更新 last_event_id 为 {task_info['last_event_id']}")
+                            self.save_tracking_tasks()
                 except Exception as e:
                     logger.exception(f"repo_polling: {owner}/{repo} 轮询异常")
-                    await self.send_notification(unified_msg_origin, f"[{owner}/{repo}] 轮询时出错：{str(e)}")
+                    await self.send_notification(unified_msg_origin, f"[{owner}/{repo}] 轮询时出错：{str(e)}", is_error=True)
                 await asyncio.sleep(self.poll_interval)
 
     async def author_polling(self, unified_msg_origin: str, task_info: dict):
@@ -330,43 +356,46 @@ class GitHubTracker(Star):
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    async with session.get(url) as resp:
-                        logger.debug(f"author_polling: 用户 {username} 状态码: {resp.status}")
-                        if resp.status != 200:
-                            await self.send_notification(unified_msg_origin, f"[{username}] 获取公开事件失败，状态码：{resp.status}")
-                        else:
-                            events = await resp.json()
-                            logger.debug(f"author_polling: 用户 {username} 返回事件数: {len(events)}")
-                            new_events = []
-                            for event_item in events:
-                                event_type = event_item.get("type")
-                                if event_type not in ["IssuesEvent", "PullRequestEvent"]:
-                                    continue
-                                try:
-                                    event_id = int(event_item.get("id"))
-                                except (ValueError, TypeError):
-                                    continue
-                                if task_info["last_event_id"] is None:
-                                    task_info["last_event_id"] = event_id
-                                    logger.debug(f"author_polling: 初始化 last_event_id 为 {event_id}")
-                                    break
-                                if event_id > task_info["last_event_id"]:
-                                    new_events.append((event_id, event_item))
-                            if new_events:
-                                new_events.sort(key=lambda x: x[0])
-                                for event_id, event_item in new_events:
-                                    action = event_item.get("payload", {}).get("action", "unknown")
-                                    title = (event_item.get("payload", {}).get("issue", {}).get("title") or
-                                             event_item.get("payload", {}).get("pull_request", {}).get("title", ""))
-                                    msg = f"[{username}] 新 {event_item.get('type')}：{action} {title}"
-                                    logger.debug(f"author_polling: 检测到新事件: {msg}")
-                                    await self.send_notification(unified_msg_origin, msg)
-                                task_info["last_event_id"] = max(eid for eid, _ in new_events)
-                                logger.debug(f"author_polling: 更新 last_event_id 为 {task_info['last_event_id']}")
-                                self.save_tracking_tasks()
+                    success, result = await self.request_github_api(session, url)
+                    
+                    if not success:
+                        # 请求失败，发送错误通知（如果配置允许）
+                        logger.error(f"author_polling: 用户 {username} 请求失败: {result}")
+                        await self.send_notification(unified_msg_origin, f"[{username}] 获取公开事件失败: {result}", is_error=True)
+                    else:
+                        # 请求成功，处理事件
+                        events = result
+                        logger.debug(f"author_polling: 用户 {username} 返回事件数: {len(events)}")
+                        new_events = []
+                        for event_item in events:
+                            event_type = event_item.get("type")
+                            if event_type not in ["IssuesEvent", "PullRequestEvent"]:
+                                continue
+                            try:
+                                event_id = int(event_item.get("id"))
+                            except (ValueError, TypeError):
+                                continue
+                            if task_info["last_event_id"] is None:
+                                task_info["last_event_id"] = event_id
+                                logger.debug(f"author_polling: 初始化 last_event_id 为 {event_id}")
+                                break
+                            if event_id > task_info["last_event_id"]:
+                                new_events.append((event_id, event_item))
+                        if new_events:
+                            new_events.sort(key=lambda x: x[0])
+                            for event_id, event_item in new_events:
+                                action = event_item.get("payload", {}).get("action", "unknown")
+                                title = (event_item.get("payload", {}).get("issue", {}).get("title") or
+                                        event_item.get("payload", {}).get("pull_request", {}).get("title", ""))
+                                msg = f"[{username}] 新 {event_item.get('type')}：{action} {title}"
+                                logger.debug(f"author_polling: 检测到新事件: {msg}")
+                                await self.send_notification(unified_msg_origin, msg)
+                            task_info["last_event_id"] = max(eid for eid, _ in new_events)
+                            logger.debug(f"author_polling: 更新 last_event_id 为 {task_info['last_event_id']}")
+                            self.save_tracking_tasks()
                 except Exception as e:
                     logger.exception(f"author_polling: 用户 {username} 轮询异常")
-                    await self.send_notification(unified_msg_origin, f"[{username}] 轮询时出错：{str(e)}")
+                    await self.send_notification(unified_msg_origin, f"[{username}] 轮询时出错：{str(e)}", is_error=True)
                 await asyncio.sleep(self.poll_interval)
 
     async def person_polling(self, unified_msg_origin: str, task_info: dict):
@@ -611,3 +640,86 @@ class GitHubTracker(Star):
         summary_lines = [f"{k}: {v}" for k, v in summary_dict.items()]
         summary = f"用户 {username} 最近活动摘要：\n" + "\n".join(summary_lines)
         yield event.plain_result(summary)
+
+    async def get_github_api_headers(self):
+        """获取GitHub API请求的头信息，包括认证令牌（如果存在）"""
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "AstrBot-GitHubTracker"
+        }
+        if self.github_token:
+            headers["Authorization"] = f"token {self.github_token}"
+        return headers
+        
+    async def update_rate_limit_from_response(self, response):
+        """从响应头更新速率限制信息"""
+        if "X-RateLimit-Limit" in response.headers:
+            self.rate_limit["limit"] = int(response.headers["X-RateLimit-Limit"])
+        if "X-RateLimit-Remaining" in response.headers:
+            self.rate_limit["remaining"] = int(response.headers["X-RateLimit-Remaining"])
+        if "X-RateLimit-Reset" in response.headers:
+            self.rate_limit["reset"] = int(response.headers["X-RateLimit-Reset"])
+        
+        # 记录速率限制信息
+        logger.debug(f"GitHub API 速率限制: 总计 {self.rate_limit['limit']}, 剩余 {self.rate_limit['remaining']}")
+        
+    async def request_github_api(self, session, url, method="GET"):
+        """
+        发送GitHub API请求，处理速率限制和认证
+        
+        Args:
+            session: aiohttp会话对象
+            url: API请求URL
+            method: 请求方法，默认为GET
+            
+        Returns:
+            成功时返回(True, 响应JSON)，失败时返回(False, 错误消息)
+        """
+        try:
+            headers = await self.get_github_api_headers()
+            
+            # 检查是否接近速率限制
+            if self.rate_limit["remaining"] < 5:
+                now = int(time.time())
+                if now < self.rate_limit["reset"]:
+                    wait_time = self.rate_limit["reset"] - now + 1
+                    logger.warning(f"接近API速率限制，等待 {wait_time} 秒至下次重置")
+                    await asyncio.sleep(wait_time)
+            
+            async with session.request(method, url, headers=headers) as resp:
+                # 更新速率限制
+                await self.update_rate_limit_from_response(resp)
+                
+                # 处理响应
+                if resp.status == 200:
+                    return True, await resp.json()
+                elif resp.status == 403 and "X-RateLimit-Remaining" in resp.headers and resp.headers["X-RateLimit-Remaining"] == "0":
+                    reset_time = int(resp.headers.get("X-RateLimit-Reset", 0))
+                    now = int(time.time())
+                    wait_time = max(0, reset_time - now) + 1
+                    error_msg = f"达到GitHub API速率限制，将在 {wait_time} 秒后重置"
+                    logger.warning(error_msg)
+                    return False, error_msg
+                elif resp.status == 404:
+                    error_msg = "请求的资源不存在（404），可能是私有仓库或用户拼写错误"
+                    logger.error(f"{url}: {error_msg}")
+                    return False, error_msg
+                else:                    try:
+                        error_data = await resp.json()
+                        error_msg = f"API请求失败，状态码: {resp.status}, 错误: {error_data.get('message', '未知错误')}"
+                    except:
+                        error_msg = f"API请求失败，状态码: {resp.status}"
+                    logger.error(f"{url}: {error_msg}")
+                    return False, error_msg
+        except aiohttp.ClientError as e:
+            error_msg = f"API请求网络错误: {str(e)}"
+            logger.exception(error_msg)
+            return False, error_msg
+        except asyncio.TimeoutError:
+            error_msg = "API请求超时"
+            logger.error(error_msg)
+            return False, error_msg
+        except Exception as e:
+            error_msg = f"API请求未知错误: {str(e)}"
+            logger.exception(error_msg)
+            return False, error_msg
