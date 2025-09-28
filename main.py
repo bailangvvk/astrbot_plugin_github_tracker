@@ -704,7 +704,8 @@ class GitHubTracker(Star):
                     error_msg = "请求的资源不存在（404），可能是私有仓库或用户拼写错误"
                     logger.error(f"{url}: {error_msg}")
                     return False, error_msg
-                else:                    try:
+                else:
+                    try:
                         error_data = await resp.json()
                         error_msg = f"API请求失败，状态码: {resp.status}, 错误: {error_data.get('message', '未知错误')}"
                     except:
